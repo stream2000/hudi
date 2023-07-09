@@ -92,16 +92,11 @@ public class BucketBulkInsertDataInternalWriterHelper extends BulkInsertDataInte
   }
 
   protected HoodieRowCreateHandle getBucketRowCreateHandle(String fileId, int bucketId) throws Exception {
-    if (!handles.containsKey(fileId)) { // if there is no handle corresponding to the fileId
-      if (this.arePartitionRecordsSorted) {
-        // if records are sorted, we can close all existing handles
-        close();
-      }
-      HoodieRowCreateHandle rowCreateHandle = new HoodieRowCreateHandle(hoodieTable, writeConfig, fileId, getNextBucketFileId(bucketId),
-          instantTime, taskPartitionId, taskId, taskEpochId, structType, shouldPreserveHoodieMetadata);
-      handles.put(fileId, rowCreateHandle);
-    }
-    return handles.get(fileId);
+    close();
+    HoodieRowCreateHandle rowCreateHandle = new HoodieRowCreateHandle(hoodieTable, writeConfig, fileId, getNextBucketFileId(bucketId),
+        instantTime, taskPartitionId, taskId, taskEpochId, structType, shouldPreserveHoodieMetadata);
+    handles.put(String.format("%s_%d", fileId, bucketId), rowCreateHandle);
+    return rowCreateHandle;
   }
 
   @Override

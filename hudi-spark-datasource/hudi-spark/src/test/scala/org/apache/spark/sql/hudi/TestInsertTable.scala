@@ -1253,6 +1253,56 @@ class TestInsertTable extends HoodieSparkSqlTestBase {
     }
   }
 
+  test("Test Bulk Insert Into Bucket Index Table and update") {
+    withTempDir { tmp =>
+      val tableName = generateTableName
+      // Create a partitioned table
+      spark.sql(
+        s"""
+           |create table $tableName (
+           |  id int,
+           |  dt string,
+           |  name string,
+           |  price double,
+           |  ts long
+           |) using hudi
+           | tblproperties (
+           | primaryKey = 'id,name',
+           | type = 'mor',
+           | preCombineField = 'ts',
+           | hoodie.index.type = 'BUCKET',
+           | hoodie.bucket.index.hash.field = 'id,name',
+           | hoodie.datasource.write.row.writer.enable = 'true')
+           | partitioned by (dt)
+           | location '${tmp.getCanonicalPath}'
+           """.stripMargin)
+
+      spark.sql("set hoodie.datasource.write.operation=bulk_insert")
+
+      spark.sql(
+        s"""
+           | insert into $tableName values
+           | (1, 'a1,1', 10, 1000, "2021-01-05"),
+           | (2, 'a2', 20.0, 2000, "2021-01-06"),
+           | (3, 'a3,3', 30.0, 3000, "2021-01-07"),
+           | (4, 'a2', 20, 2000, "2021-01-05"),
+           | (5, 'a2', 20, 2000, "2021-01-05"),
+           | (6, 'a2', 20, 2000, "2021-01-05"),
+           | (7, 'a2', 20, 2000, "2021-01-05"),
+           | (8, 'a3,3', 30, 3000, "2021-01-05")
+           """.stripMargin)
+
+      checkAnswer(s"select id, name, price, ts, dt from $tableName where id <= 3")(
+        Seq(1, "a1,1", 10.0, 1000, "2021-01-05"),
+        Seq(2, "a2", 20.0, 2000, "2021-01-06"),
+        Seq(3, "a3,3", 30.0, 3000, "2021-01-07")
+      )
+
+      spark.sql(s"select count(distinct _hoodie_file_name) from $tableName where dt = '2021-01-05'").show()
+      spark.sql("set hoodie.datasource.write.operation=upsert")
+    }
+  }
+
   /**
    * This test is to make sure that bulk insert doesn't create a bunch of tiny files if
    * hoodie.bulkinsert.user.defined.partitioner.sort.columns doesn't start with the partition columns
