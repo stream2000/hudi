@@ -18,16 +18,22 @@
 
 package org.apache.hudi.execution.bulkinsert;
 
+import org.apache.hudi.common.fs.FSUtils;
 import org.apache.hudi.common.model.ConsistentHashingNode;
 import org.apache.hudi.common.model.HoodieConsistentHashingMetadata;
+import org.apache.hudi.common.model.HoodieFileGroup;
+import org.apache.hudi.common.model.HoodieFileGroupId;
 import org.apache.hudi.common.model.HoodieKey;
 import org.apache.hudi.common.model.HoodieRecord;
 import org.apache.hudi.common.model.HoodieTableType;
 import org.apache.hudi.common.util.ValidationUtils;
+import org.apache.hudi.common.util.collection.Pair;
 import org.apache.hudi.index.bucket.ConsistentBucketIdentifier;
 import org.apache.hudi.index.bucket.ConsistentBucketIndexUtils;
 import org.apache.hudi.index.bucket.HoodieSparkConsistentBucketIndex;
+import org.apache.hudi.table.ConsistentHashingBucketInsertPartitioner;
 import org.apache.hudi.table.HoodieTable;
+
 import org.apache.spark.Partitioner;
 import org.apache.spark.api.java.JavaRDD;
 
@@ -35,6 +41,7 @@ import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.stream.Collectors;
 
 import static org.apache.hudi.config.HoodieClusteringConfig.PLAN_STRATEGY_SORT_COLUMNS;
@@ -42,7 +49,7 @@ import static org.apache.hudi.config.HoodieClusteringConfig.PLAN_STRATEGY_SORT_C
 /**
  * A partitioner for (consistent hashing) bucket index used in bulk_insert
  */
-public class RDDConsistentBucketBulkInsertPartitioner<T> extends RDDBucketIndexPartitioner<T> {
+public class RDDConsistentBucketBulkInsertPartitioner<T> extends RDDBucketIndexPartitioner<T> implements ConsistentHashingBucketInsertPartitioner {
 
   private final Map<String, List<ConsistentHashingNode>> hashingChildrenNodes;
 
@@ -92,6 +99,7 @@ public class RDDConsistentBucketBulkInsertPartitioner<T> extends RDDBucketIndexP
     });
   }
 
+  @Override
   public void addHashingChildrenNodes(String partition, List<ConsistentHashingNode> nodes) {
     ValidationUtils.checkState(nodes.stream().noneMatch(n -> n.getTag() == ConsistentHashingNode.NodeTag.NORMAL), "children nodes should not be tagged as NORMAL");
     hashingChildrenNodes.put(partition, nodes);
@@ -115,36 +123,38 @@ public class RDDConsistentBucketBulkInsertPartitioner<T> extends RDDBucketIndexP
    */
   private Map<String, ConsistentBucketIdentifier> initializeBucketIdentifier(JavaRDD<HoodieRecord<T>> records) {
     return records.map(HoodieRecord::getPartitionPath).distinct().collect().stream()
-        .collect(Collectors.toMap(p -> p, p -> getBucketIdentifier(p)));
+        .collect(Collectors.toMap(p -> p, this::getBucketIdentifier));
   }
 
   /**
    * Initialize fileIdPfx for each data partition. Specifically, the following fields is constructed:
    * - fileIdPfxList: the Nth element corresponds to the Nth data partition, indicating its fileIdPfx
-   * - doAppend: represents if the Nth data partition should use AppendHandler
    * - partitionToFileIdPfxIdxMap (return value): (table partition) -> (fileIdPfx -> idx) mapping
+   * - doAppend: represents if the Nth data partition should use AppendHandler
    *
    * @param partitionToIdentifier Mapping from table partition to bucket identifier
    */
   private Map<String, Map<String, Integer>> generateFileIdPfx(Map<String, ConsistentBucketIdentifier> partitionToIdentifier) {
-    Map<String, Map<String, Integer>> partitionToFileIdPfxIdxMap = new HashMap(partitionToIdentifier.size() * 2);
-    int count = 0;
-    for (ConsistentBucketIdentifier identifier : partitionToIdentifier.values()) {
-      Map<String, Integer> fileIdPfxToIdx = new HashMap();
-      for (ConsistentHashingNode node : identifier.getNodes()) {
-        fileIdPfxToIdx.put(node.getFileIdPrefix(), count++);
-      }
+    Map<String, Map<String, Integer>> partitionToFileIdPfxIdxMap = ConsistentBucketIndexUtils.generatePartitionToFileIdPfxIdxMap(partitionToIdentifier);
+    partitionToIdentifier.forEach((partitionPath, identifier) -> {
       fileIdPfxList.addAll(identifier.getNodes().stream().map(ConsistentHashingNode::getFileIdPrefix).collect(Collectors.toList()));
-      if (identifier.getMetadata().isFirstCreated()) {
-        // Create new file group when the hashing metadata is new (i.e., first write to the partition)
-        doAppend.addAll(Collections.nCopies(identifier.getNodes().size(), false));
-      } else {
-        // Child node requires generating a fresh new base file, rather than log file
-        doAppend.addAll(identifier.getNodes().stream().map(n -> n.getTag() == ConsistentHashingNode.NodeTag.NORMAL).collect(Collectors.toList()));
-      }
-      partitionToFileIdPfxIdxMap.put(identifier.getMetadata().getPartitionPath(), fileIdPfxToIdx);
-    }
+      // Get all file-ids that already have committed file slices
+      Set<String> fileIdsWithCommittedFileSlice = table.getFileSystemView()
+          .getAllFileGroups(partitionPath)
+          .filter(fg -> fg.getAllFileSlices().findAny().isPresent())
+          .map(HoodieFileGroup::getFileGroupId)
+          .map(HoodieFileGroupId::getFileId)
+          .collect(Collectors.toSet());
 
+      ValidationUtils.checkArgument(identifier.getNodes()
+          .stream()
+          .map(n -> Pair.of(n.getTag(), FSUtils.createNewFileId(n.getFileIdPrefix(), 0)))
+          .allMatch(p -> p.getLeft() != ConsistentHashingNode.NodeTag.NORMAL || !fileIdsWithCommittedFileSlice.contains(p.getRight())),
+          "Consistent Hashing bulk_insert only support write to new file group");
+
+      // Always create new base file for consistent hashing bulk insert
+      doAppend.addAll(Collections.nCopies(identifier.getNodes().size(), false));
+    });
     ValidationUtils.checkState(fileIdPfxList.size() == partitionToIdentifier.values().stream().mapToInt(ConsistentBucketIdentifier::getNumBuckets).sum(),
         "Error state after constructing fileId & idx mapping");
     return partitionToFileIdPfxIdxMap;
