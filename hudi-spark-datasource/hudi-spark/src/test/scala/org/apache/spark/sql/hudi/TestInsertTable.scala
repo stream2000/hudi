@@ -18,13 +18,16 @@
 package org.apache.spark.sql.hudi
 
 import org.apache.hudi.DataSourceWriteOptions._
-import org.apache.hudi.{DataSourceWriteOptions,HoodieCLIUtils, HoodieSparkUtils}
+import org.apache.hudi.client.clustering.plan.strategy.SparkConsistentBucketClusteringPlanStrategy
+import org.apache.hudi.client.clustering.run.strategy.SparkConsistentBucketClusteringExecutionStrategy
+import org.apache.hudi.common.config.HoodieStorageConfig
+import org.apache.hudi.{DataSourceWriteOptions, HoodieCLIUtils, HoodieSparkUtils}
 import org.apache.hudi.common.model.HoodieRecord.HoodieRecordType
 import org.apache.hudi.common.model.{HoodieRecord, WriteOperationType}
 import org.apache.hudi.common.table.timeline.{HoodieActiveTimeline, HoodieInstant}
 import org.apache.hudi.common.table.{HoodieTableMetaClient, TableSchemaResolver}
 import org.apache.hudi.common.util.{Option => HOption}
-import org.apache.hudi.config.HoodieWriteConfig
+import org.apache.hudi.config.{HoodieClusteringConfig, HoodieIndexConfig, HoodieWriteConfig}
 import org.apache.hudi.exception.{HoodieDuplicateKeyException, HoodieException}
 import org.apache.hudi.execution.bulkinsert.BulkInsertSortMode
 import org.apache.spark.sql.SaveMode
@@ -33,6 +36,8 @@ import org.apache.spark.sql.hudi.command.HoodieSparkValidateDuplicateKeyRecordMe
 import org.junit.jupiter.api.Assertions.assertEquals
 
 import java.io.File
+import scala.collection.convert.ImplicitConversions.`map AsJavaMap`
+import scala.language.postfixOps
 
 class TestInsertTable extends HoodieSparkSqlTestBase {
 
@@ -1525,7 +1530,7 @@ class TestInsertTable extends HoodieSparkSqlTestBase {
 
   test("Test Bulk Insert Into Consistent Hashing Bucket Index Table") {
     withSQLConf("hoodie.datasource.write.operation" -> "bulk_insert") {
-      Seq("false", "true").foreach { bulkInsertAsRow =>
+      Seq("true", "false").foreach { bulkInsertAsRow =>
         withTempDir { tmp =>
           val tableName = generateTableName
           val basePath = s"${tmp.getCanonicalPath}/$tableName"
@@ -1603,20 +1608,20 @@ class TestInsertTable extends HoodieSparkSqlTestBase {
             Seq(6, "a3,2", 31.0, 3000, "2021-01-05")
           )
 
-          // Set up clustering configs, need to simplify this in the future
-          spark.sql(s"set hoodie.datasource.write.row.writer.enable = '$bulkInsertAsRow'")
-          spark.sql("set hoodie.index.type = BUCKET")
-          spark.sql("set hoodie.bucket.index.hash.field = id,name")
-          spark.sql("set hoodie.datasource.write.recordkey.field = id,name")
-          spark.sql("set hoodie.index.bucket.engine = CONSISTENT_HASHING")
-          spark.sql("set hoodie.parquet.max.file.size = 10")
-          spark.sql("set hoodie.clustering.plan.strategy.class = org.apache.hudi.client.clustering.plan.strategy.SparkConsistentBucketClusteringPlanStrategy")
-          spark.sql("set hoodie.clustering.execution.strategy.class = org.apache.hudi.client.clustering.run.strategy.SparkConsistentBucketClusteringExecutionStrategy")
-          spark.sql("set hoodie.bucket.index.min.num.buckets = 2")
-          spark.sql("set hoodie.parquet.max.file.size = 10")
+          spark.sessionState.conf.setConfString("hoodie.datasource.write.row.writer.enable", s"$bulkInsertAsRow")
+          spark.sessionState.conf.setConfString("hoodie.index.type", "BUCKET")
+          spark.sessionState.conf.setConfString("hoodie.bucket.index.hash.field", "id,name")
+          spark.sessionState.conf.setConfString("hoodie.datasource.write.recordkey.field", "id,name")
+          spark.sessionState.conf.setConfString("hoodie.index.bucket.engine", "CONSISTENT_HASHING")
+          spark.sessionState.conf.setConfString("hoodie.parquet.max.file.size", "10")
+          spark.sessionState.conf.setConfString("hoodie.clustering.plan.strategy.class", "org.apache.hudi.client.clustering.plan.strategy.SparkConsistentBucketClusteringPlanStrategy")
+          spark.sessionState.conf.setConfString("hoodie.clustering.execution.strategy.class", "org.apache.hudi.client.clustering.run.strategy.SparkConsistentBucketClusteringExecutionStrategy")
+          spark.sessionState.conf.setConfString("hoodie.bucket.index.min.num.buckets", "2")
+          spark.sessionState.conf.setConfString("hoodie.index.type", "BUCKET")
 
           val client = HoodieCLIUtils.createHoodieWriteClient(spark, basePath, Map.empty, Option(tableName))
           val instant = HoodieActiveTimeline.createNewInstantTime
+
           // Test bucket merge by clustering
           client.scheduleClusteringAtInstant(instant, HOption.empty())
 
@@ -1624,7 +1629,23 @@ class TestInsertTable extends HoodieSparkSqlTestBase {
             Seq(instant, 10, HoodieInstant.State.REQUESTED.name(), "*")
           )
 
+          client.cluster(instant)
+
+          checkAnswer(s"call show_clustering(table => '$tableName')")(
+            Seq(instant, 10, HoodieInstant.State.COMPLETED.name(), "*")
+          )
+
           spark.sql("set hoodie.datasource.write.operation = bulk_insert")
+          spark.sessionState.conf.unsetConf("hoodie.datasource.write.row.writer.enable")
+          spark.sessionState.conf.unsetConf("hoodie.index.type")
+          spark.sessionState.conf.unsetConf("hoodie.bucket.index.hash.field")
+          spark.sessionState.conf.unsetConf("hoodie.datasource.write.recordkey.field")
+          spark.sessionState.conf.unsetConf("hoodie.index.bucket.engine")
+          spark.sessionState.conf.unsetConf("hoodie.parquet.max.file.size")
+          spark.sessionState.conf.unsetConf("hoodie.clustering.plan.strategy.class")
+          spark.sessionState.conf.unsetConf("hoodie.clustering.execution.strategy.class")
+          spark.sessionState.conf.unsetConf("hoodie.bucket.index.min.num.buckets")
+          spark.sessionState.conf.unsetConf("hoodie.index.type")
         }
       }
     }

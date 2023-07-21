@@ -18,19 +18,17 @@
 
 package org.apache.hudi.execution.bulkinsert;
 
-import org.apache.hudi.common.fs.FSUtils;
 import org.apache.hudi.common.model.ConsistentHashingNode;
 import org.apache.hudi.common.model.HoodieConsistentHashingMetadata;
-import org.apache.hudi.common.model.HoodieFileGroup;
-import org.apache.hudi.common.model.HoodieFileGroupId;
 import org.apache.hudi.common.model.HoodieKey;
 import org.apache.hudi.common.model.HoodieRecord;
 import org.apache.hudi.common.model.HoodieTableType;
+import org.apache.hudi.common.util.Option;
 import org.apache.hudi.common.util.ValidationUtils;
-import org.apache.hudi.common.util.collection.Pair;
 import org.apache.hudi.index.bucket.ConsistentBucketIdentifier;
 import org.apache.hudi.index.bucket.ConsistentBucketIndexUtils;
 import org.apache.hudi.index.bucket.HoodieSparkConsistentBucketIndex;
+import org.apache.hudi.io.WriteHandleFactory;
 import org.apache.hudi.table.ConsistentHashingBucketInsertPartitioner;
 import org.apache.hudi.table.HoodieTable;
 
@@ -41,7 +39,6 @@ import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.Set;
 import java.util.stream.Collectors;
 
 import static org.apache.hudi.config.HoodieClusteringConfig.PLAN_STRATEGY_SORT_COLUMNS;
@@ -138,25 +135,29 @@ public class RDDConsistentBucketBulkInsertPartitioner<T> extends RDDBucketIndexP
     Map<String, Map<String, Integer>> partitionToFileIdPfxIdxMap = ConsistentBucketIndexUtils.generatePartitionToFileIdPfxIdxMap(partitionToIdentifier);
     partitionToIdentifier.forEach((partitionPath, identifier) -> {
       fileIdPfxList.addAll(identifier.getNodes().stream().map(ConsistentHashingNode::getFileIdPrefix).collect(Collectors.toList()));
-      // Get all file-ids that already have committed file slices
-      Set<String> fileIdsWithCommittedFileSlice = table.getFileSystemView()
-          .getAllFileGroups(partitionPath)
-          .filter(fg -> fg.getAllFileSlices().findAny().isPresent())
-          .map(HoodieFileGroup::getFileGroupId)
-          .map(HoodieFileGroupId::getFileId)
-          .collect(Collectors.toSet());
-
-      ValidationUtils.checkArgument(identifier.getNodes()
-          .stream()
-          .map(n -> Pair.of(n.getTag(), FSUtils.createNewFileId(n.getFileIdPrefix(), 0)))
-          .allMatch(p -> p.getLeft() != ConsistentHashingNode.NodeTag.NORMAL || !fileIdsWithCommittedFileSlice.contains(p.getRight())),
-          "Consistent Hashing bulk_insert only support write to new file group");
-
-      // Always create new base file for consistent hashing bulk insert
-      doAppend.addAll(Collections.nCopies(identifier.getNodes().size(), false));
+      Map<String, Integer> fileIdPfxToIdx = new HashMap();
+      int count = 0;
+      for (ConsistentHashingNode node : identifier.getNodes()) {
+        fileIdPfxToIdx.put(node.getFileIdPrefix(), count++);
+      }
+      if (identifier.getMetadata().isFirstCreated()) {
+        // Create new file group when the hashing metadata is new (i.e., first write to the partition)
+        doAppend.addAll(Collections.nCopies(identifier.getNodes().size(), false));
+      } else {
+        // Child node requires generating a fresh new base file, rather than log file
+        doAppend.addAll(identifier.getNodes().stream().map(n -> n.getTag() == ConsistentHashingNode.NodeTag.NORMAL).collect(Collectors.toList()));
+      }
+      partitionToFileIdPfxIdxMap.put(identifier.getMetadata().getPartitionPath(), fileIdPfxToIdx);
     });
     ValidationUtils.checkState(fileIdPfxList.size() == partitionToIdentifier.values().stream().mapToInt(ConsistentBucketIdentifier::getNumBuckets).sum(),
         "Error state after constructing fileId & idx mapping");
     return partitionToFileIdPfxIdxMap;
+  }
+
+  @Override
+  public Option<WriteHandleFactory> getWriteHandleFactory(int idx) {
+    // Add check to align with `ConsistentBucketBulkInsertDataInternalWriterHelper`
+    ValidationUtils.checkArgument(!doAppend.get(idx), "Consistent Hashing bulk_insert only support write to new file group");
+    return super.getWriteHandleFactory(idx);
   }
 }
